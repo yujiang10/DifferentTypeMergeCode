@@ -1,0 +1,129 @@
+/*
+ * LogLoadJobStart - Log the start of a DataHub load job
+*/
+USE [VOC_Operations]
+GO
+
+/****** Object:  StoredProcedure [dbo].[LogLoadJobStart]    Script Date: 14/06/2025 10:42:17 AM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+CREATE PROCEDURE [dbo].[LogLoadJobStart] (
+	@jobName as nvarchar(128),
+	@jobDateTime as datetime,
+	@process as [nvarchar](523),
+	@sourceDatabase as nvarchar(128),
+	@destDatabase as nvarchar(128)
+) AS
+BEGIN
+
+	DECLARE @iLoggingLevel int = 2			-- Set = 0 for no logging; 1 = error logging; 2 = standard logging; 3 = verbose logging to [etl].[Log_VOC_App_ETL] 
+	DECLARE @bSupportJobReporting bit = 1	-- Set = 1 to populate VOC_Operations job reporting  
+
+	DECLARE @iIdentCurrent int
+
+	BEGIN TRY
+
+		IF ( @destDatabase like 'VOC_App%' )
+		BEGIN
+			IF @bSupportJobReporting = 1
+			BEGIN
+				INSERT INTO [dbo].[JobRun_AppDB] (
+					[jobName], 
+					[process], 
+					[sourceDataBase], 
+					[destDatabase], 
+					[startDateTime], 
+					[endDateTime], 
+					[jobDuration_sec], 
+					[status], 
+					[errorNumber], 
+					[errorMessage], 
+					[metaData])
+				VALUES (
+					@jobName,
+					@process,
+					@sourceDatabase,
+					@destDatabase,
+					@jobDateTime,
+					NULL, 
+					NULL, 
+					'STARTED',
+					NULL, 
+					NULL, 
+					NULL
+					)
+
+				SET @iIdentCurrent = IDENT_CURRENT('[dbo].[JobRun_AppDB]');
+			END
+
+			IF @iLoggingLevel >= 3
+			BEGIN
+				INSERT INTO [dbo].[Log_VOC_App_ETL] ([TS],[Source],[ErrorNumber],[ErrorMessage],[Metadata],[RowCount])
+						VALUES (sysdatetime(),coalesce(OBJECT_NAME(@@PROCID),'SP'),null,null,concat('Starting Load Logging to ','JobRun_AppDB'),null)
+
+			END
+		END
+		ELSE
+		BEGIN
+			IF @bSupportJobReporting = 1
+			BEGIN
+				INSERT INTO [dbo].[JobRun_DataHub] (
+					[jobName], 
+					[process], 
+					[sourceDataBase], 
+					[destDatabase], 
+					[startDateTime], 
+					[endDateTime], 
+					[jobDuration_sec], 
+					[status], 
+					[errorNumber], 
+					[errorMessage], 
+					[metaData])
+				VALUES (
+					@jobName,
+					@process,
+					@sourceDatabase,
+					@destDatabase,
+					@jobDateTime,
+					NULL, 
+					NULL, 
+					'STARTED',
+					NULL, 
+					NULL, 
+					NULL
+					);
+
+				SET @iIdentCurrent = IDENT_CURRENT('[dbo].[JobRun_DataHub]');
+			END
+
+			IF @iLoggingLevel >= 3
+			BEGIN
+				INSERT INTO [dbo].[Log_VOC_App_ETL] ([TS],[Source],[ErrorNumber],[ErrorMessage],[Metadata],[RowCount])
+						VALUES (sysdatetime(),coalesce(OBJECT_NAME(@@PROCID),'SP'),null,null,concat('Starting Load Logging to ','JobRun_DataHub'),null)
+			END
+		END
+
+		RETURN coalesce(@iIdentCurrent,0)
+	END TRY
+	BEGIN CATCH
+		DECLARE @iErrNo int = ERROR_NUMBER() 
+		DECLARE @nErrMsg nvarchar(2048) = ERROR_MESSAGE() 
+
+		IF coalesce(@iLoggingLevel,0) <> 0
+		BEGIN
+			INSERT INTO [dbo].[Log_VOC_App_ETL] ([TS],[Source],[ErrorNumber],[ErrorMessage],[Metadata],[RowCount])
+				VALUES (sysdatetime(),coalesce(OBJECT_NAME(@@PROCID),'SP'),@iErrNo,@nErrMsg,'',null)
+		END;
+
+		THROW;
+
+		RETURN -1
+	END CATCH
+END
+GO
+
+
