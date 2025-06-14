@@ -1,0 +1,265 @@
+/*
+ * Type1MergebySourcee - Insert new records, update existing records and delete old records, filter by source
+ */
+
+USE [VOC_Operations]
+GO
+
+/****** Object:  StoredProcedure [dbo].[Type1MergeBySource]    Script Date: 14/06/2025 10:30:29 AM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+CREATE PROCEDURE [dbo].[Type1MergeBySource] (
+	@source as nvarchar(386),
+	@destination as nvarchar(386),
+	@recordSourceCode as nvarchar(max)
+) AS
+
+
+
+	-- declare @destination as nvarchar(386) = 'VOC_DataHub.Data.Person';
+	-- declare @source as nvarchar(386) = 'CARE_Staging.Export.VW_Person';	
+	-- declare @recordSourceCode as nvarchar(max) = 'CARE'
+
+	declare @schemaSeparatorIndex as int;
+	declare @tableSeparatorIndex as int;
+	declare @errorMessage as nvarchar(2047);					-- variable for constructing error messages that contain data from other variable. (THROW statement does not allow for build strings like "THROW -1, 'Bad Name: ' + @name")
+
+	/*
+	 * Parse @destination
+	 */
+	set @schemaSeparatorIndex = CHARINDEX('.', @destination)
+	set @errorMessage = 'destination (' + @destination + ') does not include schema.'
+	if @schemaSeparatorIndex = 0 THROW 51000, @errorMessage, 1;
+
+	set @tableSeparatorIndex = CHARINDEX('.', @destination, @schemaSeparatorIndex + 1)
+	set @errorMessage = 'destination (' + @destination + ') does not include table.'
+	if @tableSeparatorIndex = 0 THROW 51000, @errorMessage, 1;
+
+	declare @destDatabase as sysname;
+	set @destDatabase = SUBSTRING(@destination, 0, @schemaSeparatorIndex)
+	declare @destSchema as sysname
+	set @destSchema = SUBSTRING(@destination, @schemaSeparatorIndex+1, @tableSeparatorIndex - @schemaSeparatorIndex - 1);
+	declare @destTable as sysname;
+	select @destTable = SUBSTRING(@destination, @tableSeparatorIndex+1, len(@destination) - @tableSeparatorIndex)
+	-- print '@destDatabase = ' + @destDatabase
+	-- print '@destSchema = ' + @destSchema
+	-- print '@destTable = ' + @destTable
+
+	/*
+	 * Parse @source
+	 */
+	set @schemaSeparatorIndex = CHARINDEX('.', @source)
+	set @errorMessage = 'source (' + @source + ') does not include schema.'
+	if @schemaSeparatorIndex = 0 THROW 51000, @errorMessage, 1;
+
+	set @tableSeparatorIndex = CHARINDEX('.', @source, @schemaSeparatorIndex + 1)
+	set @errorMessage = 'source (' + @source + ') does not include table.'
+	if @tableSeparatorIndex = 0 THROW 51000, @errorMessage, 1;
+
+	declare @sourceDatabase as sysname;
+	set @sourceDatabase = SUBSTRING(@source, 0, @schemaSeparatorIndex)
+	declare @sourceSchema as sysname
+	set @sourceSchema = SUBSTRING(@source, @schemaSeparatorIndex+1, @tableSeparatorIndex - @schemaSeparatorIndex - 1);
+	declare @sourceEntity as sysname;
+	select @sourceEntity = SUBSTRING(@source, @tableSeparatorIndex+1, len(@source) - @tableSeparatorIndex)
+	-- print '@sourceDatabase = ' + @sourceDatabase
+	-- print '@sourceSchema = ' + @sourceSchema
+	-- print '@sourceEntity = ' + @sourceEntity
+
+	/*
+	 * Merge variables
+	 */
+
+	declare @sourceRowCount as int;
+
+	declare @columnList as nvarchar(max);					-- csv string of all sc2 columns (All columns in master table except _SK, effective from/to columns
+	declare @sourceColumnList as nvarchar(max);				-- csv string of all sc2 columns prefixed with [source] for use in MERGE statement creation
+	declare @destColumnList as nvarchar(max);				-- csv string of all sc2 columns prefixed with [dest] for use in MERGE statement creation.
+
+	declare @type1CompareSql as nvarchar(max);				-- sql fragement containing the column compare.
+	declare @columnUpdateSql as nvarchar(max);
+
+	declare @usingSQL as nvarchar(133)						-- variable for holding the using statement so this stored proc works across databases
+	declare @execSQL as nvarchar(max)						-- variable for temporary sql statements for executing (required for sp_executesql calls
+	declare @mergeSQL as nvarchar(max)						-- variable for holding the final constructed merge statement
+	declare @mergeSQLPrimaryKeyPrdicate as nvarchar(max)	-- variable for holding primary key matching string for the merge statement
+
+	/*
+	 * Check that parameters are set
+	 */
+	if @destDatabase is null
+		throw 51000, '@destDatatbase parameter not set', 1
+	if @destSchema is null
+		throw 51000, '@destSchema parameter not set', 1
+	if @destTable is null
+		throw 51000, '@destTable parameter not set', 1
+	if @sourceDatabase is null
+		throw 51000, '@sourceDatatbase parameter not set', 1
+	if @sourceSchema is null
+		throw 51000, '@sourceSchema parameter not set', 1
+	if @sourceEntity is null
+		throw 51000, '@sourceEntity parameter not set', 1
+
+	/*
+	 * Check databases exist
+	 */
+	if db_id(@sourceDatabase) is null begin
+		select @errorMessage  = 'could not find database specified by @sourceDatabase parameter (' + @sourceDatabase + ')';
+		throw 51000, @errorMessage , 1
+	end
+	if db_id(@destDatabase) is null begin
+		select @errorMessage  = 'could not find database specified by @destDatabase parameter (' + @destDatabase + ')';
+		throw 51000, @errorMessage , 1
+	end
+
+	select @usingSQL = 'USE ' + @destDatabase + ';'
+
+	/*
+	 * Check that destination schema and table exist
+	 */
+	set @errorMessage = 'Destination schema (' + @destSchema + ') does not exist.'
+	exec(@usingSQL + '
+		IF NOT EXISTS(SELECT name FROM sys.schemas WHERE name = ''' + @destSchema + ''') 
+			THROW 51000, ''' + @errorMessage + ''', 1;
+		')
+
+	set @errorMessage = 'Destintation Table (' + @destTable + ') does not exist.'
+	exec(@usingSQL + '
+		if not exists (select * from sys.tables where name = ''' + @destTable + ''') 
+			THROW 51000, ''' + @errorMessage + ''', 1;
+		')
+	declare @destPath as nvarchar(max) = @destSchema + '.' + @destTable
+	-- print  '@destPath  = ' + @destPath  
+
+	/*
+	 * Check that source schema and entity exist
+	 */
+	set @errorMessage = 'Source schema (' + @sourceDatabase + '.' + @sourceSchema + ') does not exist.'
+	exec(@usingSQL + '
+		IF NOT EXISTS(SELECT name FROM ' + @sourceDatabase + '.sys.schemas WHERE name = ''' + @sourceSchema + ''') 
+			THROW 51000, ''' + @errorMessage + ''', 1;
+		')
+
+	set @errorMessage = 'Source entity (' + @sourceDatabase + '.' + @sourceSchema + '.' + @sourceEntity + ') does not exist.'
+	exec(@usingSQL + '
+		if not exists (
+				select st.name from ' + @sourceDatabase + '.sys.tables st join ' + @sourceDatabase + '.sys.schemas ss on ss.schema_id = st.schema_id
+					where st.name = ''' + @sourceEntity  + ''' and ss.name = ''' + @sourceSchema + '''
+				UNION select sv.name from ' + @sourceDatabase + '.sys.views sv join ' + @sourceDatabase + '.sys.schemas ss on ss.schema_id = sv.schema_id
+					where sv.name = ''' + @sourceEntity  + ''' and ss.name = ''' + @sourceSchema + '''
+			)
+			throw 51000, ''' + @errorMessage + ''', 1
+		')
+	declare @sourcePath as nvarchar(386) =  @sourceDatabase + '.' + @sourceSchema + '.' + @sourceEntity
+	-- print  '@sourcePath  = ' + @sourcePath  
+
+	-- fail if no source entity is empty  - this will prevent table truncations
+	-- set @execSQL = @usingSQL + N'Select @workRowCount = count(*) from ' + @sourcePath
+	-- exec sp_executesql @execSQL, N'@workRowCount int output', @workRowCount output
+	--if @workRowCount = 0 Return -- this has been removed as there should be checks during processing to ensure all data is correct
+
+	-- strip [] charactres from table names
+	-- select @destinationTable  = REPLACE(REPLACE(@destinationTable,'[',''),']','')
+	-- print  '@destinationTable= ' + @destinationTable  
+
+
+	/*
+	 * Build sc1 columns strings
+	 */
+	select @execSQL = @usingSQL + '
+		SELECT 
+		@columnList =   COALESCE(@columnList+ '','', '''') + ''['' + sc.NAME + '']'',
+		@sourceColumnList =   COALESCE(@sourceColumnList + '','', '''') + ''[source].['' + sc.NAME + '']'',
+		@destColumnList =   COALESCE(@destColumnList+ '','', '''') + ''[dest].['' + sc.NAME + '']'',
+		@type1CompareSql = case when sc.system_type_id <> 240 then COALESCE(@type1CompareSql+ '' OR  '', '''') + ''([source].['' + sc.NAME + ''] <> [destination].['' + sc.NAME + '']  OR ([source].['' + sc.NAME + ''] IS NULL AND  [destination].['' + sc.NAME + ''] IS NOT NULL)  OR ([source].['' + sc.NAME + ''] IS NOT NULL AND  [destination].['' + sc.NAME + ''] IS NULL) )'' else @type1CompareSql end,
+		@columnUpdateSql = case when sc.system_type_id <> 240 then COALESCE(@columnUpdateSql+ '', '', '''') + ''[destination].['' + sc.NAME + ''] = [source].['' + sc.NAME + '']  '' else @columnUpdateSql end
+		FROM ' + @destDatabase + '.sys.tables st
+		INNER JOIN ' + @destDatabase + '.sys.columns sc ON st.object_id = sc.object_id
+		WHERE 
+		st.name = ''' + @destTable + '''
+		and
+		schema_name(st.schema_id)  = ''' + @destSchema + '''
+		AND
+		sc.name not in (
+			''' + @destTable + ''' + ''_sk''  --ignore surrogate key
+			,''loadDateTime''				  --ingore loadDateTime
+			,''loadEndDateTime''			  --ignore loadEndDateTime
+		)
+		'
+	exec sp_executesql @execSql
+	, N'@columnList nvarchar(max) output , @sourceColumnList nvarchar(max) output ,  @destColumnList nvarchar(max) output, @type1CompareSql nvarchar(max) output, @columnUpdateSql nvarchar(max) output'
+	, @columnList output , @sourceColumnList output ,  @destColumnList output , @type1CompareSql output, @columnUpdateSql output
+
+	-- print  '@columnList  = ' + @columnList  
+	-- print  '@sourceColumnList  = ' + @sourceColumnList  
+	-- print  '@destColumnList  = ' + @destColumnList  
+
+	/*
+	 * Build primary key strings
+	 */
+	select @execSQL = @usingSQL + '
+	SELECT @mergeSQLPrimaryKeyPrdicate = coalesce(@mergeSQLPrimaryKeyPrdicate  + '' and '','''') + ''[source].['' + ccu.COLUMN_NAME + ''] = [destination].['' + ccu.COLUMN_NAME + '']''
+	FROM ' + @destDatabase + '.INFORMATION_SCHEMA.TABLE_CONSTRAINTS AS tc
+		INNER JOIN ' + @destDatabase + '.INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE AS ccu
+    		ON tc.CONSTRAINT_NAME = ccu.CONSTRAINT_NAME
+	WHERE tc.TABLE_SCHEMA = ''' + @destSchema + '''     
+		AND tc.TABLE_NAME = ''' + @destTable + '''      
+		AND tc.CONSTRAINT_TYPE = ''PRIMARY KEY''
+		and ccu.COLUMN_NAME <> ''loadDateTime''
+		and ccu.CONSTRAINT_SCHEMA = '''+ @destSchema + ''' 
+	'
+
+	exec sp_executesql @execSql
+	, N'@mergeSQLPrimaryKeyPrdicate nvarchar(max) output '
+	, @mergeSQLPrimaryKeyPrdicate output
+
+	set @mergeSQLPrimaryKeyPrdicate = coalesce(@mergeSQLPrimaryKeyPrdicate, '1 = 1') 
+	-- print '@mergeSQLPrimaryKeyPrdicate = ' + @mergeSQLPrimaryKeyPrdicate 
+
+	/*
+	 * Build Merge query
+	 */
+	SELECT @mergeSQL = 'MERGE INTO [' + @destDatabase + '].[' + @destSchema + '].[' + @destTable + '] [destination] '
+	SELECT @mergeSQL = @mergeSQL + CHAR(13) + CHAR(10) + ' USING [' + @sourceDatabase + '].[' + @sourceSchema + '].[' + @sourceEntity + '] [source] '
+	SELECT @mergeSQL = @mergeSQL + CHAR(13) + CHAR(10) + ' ON ' + @mergeSQLPrimaryKeyPrdicate
+	SELECT @mergeSQL = @mergeSQL + CHAR(13) + CHAR(10) + ' WHEN MATCHED AND (' + @type1CompareSql + ') THEN'
+	SELECT @mergeSQL = @mergeSQL + CHAR(13) + CHAR(10) + '     UPDATE SET ' + @columnUpdateSql
+	SELECT @mergeSQL = @mergeSQL + CHAR(13) + CHAR(10) + ' WHEN NOT MATCHED BY TARGET THEN'
+	SELECT @mergeSQL = @mergeSQL + CHAR(13) + CHAR(10) + '     INSERT (' + @columnList + ',[loadDateTime])'
+	SELECT @mergeSQL = @mergeSQL + CHAR(13) + CHAR(10) + '     VALUES (' + @sourceColumnList + ',[source].[loadDateTime])'
+	SELECT @mergeSQL = @mergeSQL + CHAR(13) + CHAR(10) + ' WHEN NOT MATCHED BY SOURCE'
+	select @mergeSQL = @mergeSQL + CHAR(13) + CHAR(10) + '         AND [destination].[recordSourceCode] = ''' + @recordSourceCode + ''' THEN'
+	SELECT @mergeSQL = @mergeSQL + CHAR(13) + CHAR(10) + '     DELETE'
+	SELECT @mergeSQL = @mergeSQL + CHAR(13) + CHAR(10) + ' OUTPUT $ACTION, ' + @sourceColumnList + ',[source].[loadDateTime]'
+	SELECT @mergeSQL = @mergeSQL + CHAR(13) + CHAR(10) + ';'
+
+	-- print left(@mergeSQL,3999)
+	-- print substring(@mergeSQL,4000,7999)
+	-- print substring(@mergeSQL,8000,11999)
+	-- print substring(@mergeSQL,12000,15999)
+	-- print substring(@mergeSQL,16000,19999)
+	-- print substring(@mergeSQL,20000,23999)
+	-- print substring(@mergeSQL,24000,27999)
+	-- print substring(@mergeSQL,28000,31999)
+	-- print substring(@mergeSQL,32000,35999)
+	-- print substring(@mergeSQL,36000,39999)
+	-- print substring(@mergeSQL,40000,43999)
+	-- print substring(@mergeSQL,44000,47999)
+	-- print substring(@mergeSQL,48000,51999)
+	-- print substring(@mergeSQL,52000,55999)
+	-- print substring(@mergeSQL,56000,59999)
+	-- print substring(@mergeSQL,60000,63999)
+	-- print substring(@mergeSQL,64000,67999)
+
+	--execute the merge statement
+	EXECUTE sp_executesql  @mergeSQL;
+
+--	-- print 'All good!'
+
+RETURN @@ROWCOUNT;
+GO
+
