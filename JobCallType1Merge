@@ -1,0 +1,15 @@
+CREATE PROCEDURE [MetaData].[LoadTable_CareStagingToDataHub] (
+	@tableName as nvarchar(max),
+	@destDatabase as nvarchar(max),
+	@loadDateTime as datetime
+) AS
+
+	DECLARE @iRowCount int;
+
+	DECLARE @src varchar(max) = 'CARE_Staging.Export.VW_' + @tableName;
+    DECLARE @dest varchar(max) = 'VOC_DataHub.dbo.' + @tableName;
+	
+	EXEC @iRowCount = [VOC_Operations].[dbo].[Type1MergeBySource] @src, @dest, 'CARE';
+
+RETURN @iRowCount;
+GO
