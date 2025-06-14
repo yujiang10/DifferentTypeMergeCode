@@ -1,0 +1,54 @@
+CREATE PROCEDURE [MetaData].[CARE_Staging_to_DataHub_Step]
+	@jobName as nvarchar(max),
+	@stepName as nvarchar(max)
+AS
+	--
+	-- Merge CARE Staging data into Data Hub data
+	--
+
+	DECLARE @jobRunID as int;
+	DECLARE @jobDateTime datetime = GETDATE();
+	DECLARE @iErrorCount int;
+	DECLARE @iErrNo as int;
+	DECLARE @nErrMsg as nvarchar(1000);
+	DECLARE @sourceDatabase as nvarchar(max) = 'CARE_Staging';
+	DECLARE @destDatabase as nvarchar(max) = 'VOC_DataHub';
+
+	EXEC @jobRunID = [VOC_Operations].[dbo].[LogLoadJobStart]
+		@jobName = @jobName,
+		@jobDateTime = @jobDateTime,
+		@process = 'LoadDatabase',
+		@sourceDatabase = @sourceDatabase,
+		@destDatabase = @destDatabase;
+
+	EXEC @iErrorCount = [VOC_Operations].[dbo].[LoadDatabase]
+		@jobRunID = @jobRunID,
+		@jobName = @jobName,
+		@stepName =@stepName,
+		@jobDateTime = @jobDateTime,
+		@operation = 'Merge',
+		@sourceDatabase = @sourceDatabase,
+		@destDatabase = @destDatabase,
+		@metadataTableName = N'CARE_Staging.MetaData.ExportETL',
+		@loadProcedureName = N'CARE_Staging.MetaData.LoadTable_CareStagingToDataHub',
+		@stratumDirection = NULL;
+
+	IF @iErrorCount > 0
+	BEGIN
+		SET @iErrNo = 51000;
+		SET @nErrMsg = 'Merge CARE Staging to DataHub job failed with ' + CAST(@iErrorCount as nvarchar) + ' errors.';
+	END
+
+	EXEC [VOC_Operations].[dbo].[LogLoadJobEnd]
+		@destDatabase = @destDatabase,
+		@jobRunID = @jobRunID,
+		@jobDateTime = @jobDateTime,
+		@iErrorCount = @iErrorCount,
+		@iErrNo = @iErrNo,
+		@nErrMsg = @nErrMsg;
+
+	IF @iErrorCount > 0
+		THROW @iErrNo, @nErrMsg, 1;
+
+RETURN 0
+GO
