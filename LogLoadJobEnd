@@ -1,0 +1,126 @@
+/*
+ * LogLoadJobEnd - Log the end of a DataHub load job
+ */
+
+USE [VOC_Operations]
+GO
+
+/****** Object:  StoredProcedure [dbo].[LogLoadJobEnd]    Script Date: 14/06/2025 10:42:06 AM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+CREATE PROCEDURE [dbo].[LogLoadJobEnd] (
+	@destDatabase as nvarchar(128),
+	@jobRunID as int,
+	@jobDateTime as datetime,
+	@iErrorCount as int,
+	@iErrNo as int,
+	@nErrMsg as nvarchar(2048)
+) AS
+BEGIN
+
+	DECLARE @iLoggingLevel int = 2	-- Set = 0 for no logging; 1 = error logging; 2 = standard logging; 3 = verbose logging to [etl].[Log_VOC_App_ETL] 
+
+	BEGIN TRY
+		DECLARE @bSupportJobReporting bit = 1	-- Set = 1 to populate VOC_Operations job reporting
+	
+		DECLARE @job_run_table nvarchar(128);
+		--DECLARE @sql nvarchar(max);
+
+		DECLARE @job_end_dt datetime = getdate();
+		DECLARE @iloadDuration int = DATEDIFF(second, @jobDateTime, @job_end_dt);
+		/* 2024-02-20 AB - Integrated @status logic to a single CASE statement so all status is calculated in the same place */
+		--DECLARE @status nvarchar(30) = IIF(@iErrorCount = 0, 'SUCCESS', 'FAILED')
+		DECLARE @status nvarchar(30) 
+
+		/*  DataHub DataSourceStatus */
+		DECLARE @iRowCount int;
+		DECLARE @src nvarchar(392) = 'VOC_Operations.dbo.VW_DataSourceStatus';
+		DECLARE @dest nvarchar(392) ='VOC_DataHub.dbo.DataSourceStatus';
+
+		IF @bSupportJobReporting = 1
+		BEGIN
+			/* 2024-02-20 AB - Integrated @status logic to a single CASE statement so all status is calculated in the same place */
+			SELECT @status =
+				CASE @iErrorCount
+					WHEN -1 THEN 'SKIPPED'
+					WHEN  0 THEN 'SUCCESS'
+					ELSE 'FAILED'
+				END
+
+			IF ( @destDatabase like 'VOC_App%' )
+			BEGIN
+				SET @job_run_table = 'JobRun_AppDB'
+
+				UPDATE [dbo].[JobRun_AppDB]
+					SET	[errorNumber] = @iErrNo, 
+						[errorMessage] = @nErrMsg, 
+						[endDateTime] = @job_end_dt, 
+						[jobDuration_sec] = @iloadDuration, 
+						[status] = @status
+				WHERE [jobRunID] = CAST(@jobRunID as varchar(36)) 
+
+				IF @iLoggingLevel >= 3
+				BEGIN
+					INSERT INTO [dbo].[Log_VOC_App_ETL] ([TS],[Source],[ErrorNumber],[ErrorMessage],[Metadata],[RowCount])
+							VALUES (sysdatetime(),coalesce(OBJECT_NAME(@@PROCID),'SP'),null,null,concat('Finished Load Logging to ','JobRun_AppDB'),null)
+				END
+			END
+			ELSE
+			BEGIN
+				SET @job_run_table = 'JobRun_DataHub';
+		
+				UPDATE [dbo].[JobRun_DataHub]
+					SET	[errorNumber] = @iErrNo, 
+						[errorMessage] = @nErrMsg, 
+						[endDateTime] = @job_end_dt, 
+						[jobDuration_sec] = @iloadDuration, 
+						[status] = @status
+				WHERE [jobRunID] = CAST(@jobRunID as varchar(36)) 
+
+				IF @iLoggingLevel >= 3
+				BEGIN
+					INSERT INTO [dbo].[Log_VOC_App_ETL] ([TS],[Source],[ErrorNumber],[ErrorMessage],[Metadata],[RowCount])
+							VALUES (sysdatetime(),coalesce(OBJECT_NAME(@@PROCID),'SP'),null,null,concat('Finished Load Logging to ','JobRun_DataHub'),null)
+				END
+			END
+		END
+
+		IF ( @destDatabase not like 'VOC_App%' )
+		BEGIN
+			-- Update the DataHub DataSourceStatus table
+			/* 2024-04-30 AB - Replace Type1Merge with Upsert to stop blowing away loads by other processes */
+			-- EXEC @iRowCount = [dbo].[Type1Merge] @src, @dest;
+			EXEC @iRowCount = [dbo].Type0Upsert @src, @dest;
+
+			IF @iLoggingLevel >= 2
+			BEGIN
+				INSERT INTO [dbo].[Log_VOC_App_ETL] ([TS],[Source],[ErrorNumber],[ErrorMessage],[Metadata],[RowCount])
+						VALUES (sysdatetime(),coalesce(OBJECT_NAME(@@PROCID),'SP'),null,null,concat('Updated  ',coalesce(@dest,'@dest')),@iRowCount)
+
+			END
+		END
+	
+		RETURN 0;
+	END TRY
+	BEGIN  CATCH
+		DECLARE @iCatchErrNo int = ERROR_NUMBER() 
+		DECLARE @nCatchErrMsg nvarchar(2048) = ERROR_MESSAGE() 
+
+		IF coalesce(@iLoggingLevel,0) <> 0
+		BEGIN
+			INSERT INTO [dbo].[Log_VOC_App_ETL] ([TS],[Source],[ErrorNumber],[ErrorMessage],[Metadata],[RowCount])
+				VALUES (sysdatetime(),coalesce(OBJECT_NAME(@@PROCID),'SP'),@iCatchErrNo,@nCatchErrMsg,'',null)
+		END;
+
+		THROW;
+
+		RETURN -1
+	END CATCH
+END
+GO
+
+
