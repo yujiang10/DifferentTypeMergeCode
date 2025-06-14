@@ -1,0 +1,424 @@
+USE [HLTH_Staging]
+GO
+
+/****** Object:  StoredProcedure [etl].[spLoadDataHub_HLTH]    Script Date: 14/06/2025 10:47:51 AM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+CREATE PROCEDURE [etl].[spLoadDataHub_HLTH] AS
+BEGIN
+
+
+	/* Processing config */
+	DECLARE @iLoggingLevel int = 2	-- Set = 0 for no logging; 1 = error logging; 2 = standard logging; 3 = verbose logging to [dbo].[Log_HLTH_ETL] 
+	DECLARE @bExec bit = 1	-- Set = 1 to execute sql
+	DECLARE @bSupportJobReporting bit = 1	-- Set = 1 to populate VOC_Operations job reporting
+	DECLARE @bAlwaysUpdateDataSourceStatus bit = 1	-- Set = 1 to have this process update VOC_DataHub.dbo.DataSourceStatus even if VOC_Operations..LogLoadJobEnd is called (note that @bExec must = 1)
+
+	BEGIN TRY
+		SET NOCOUNT ON;
+
+		/* Set Run time */
+		DECLARE @dNow datetime2 = sysdatetime()
+		DECLARE @nSystemIDCode nvarchar(30) = 'HLTH'	-- cf. Cursor variable
+
+		/* Dynamic SQL and formatting constants */
+		DECLARE @nSQL as nvarchar(max)
+		DECLARE @nTAB as nchar(1) = char(9)
+		DECLARE @nCRLF as nvarchar(2) = concat(char(13),char(10))
+
+		/* General variables */
+		DECLARE @iReturn int
+		DECLARE @iRowCount int
+		DECLARE @iRowCountTotal int = 0
+		DECLARE @nOut nvarchar(max)
+
+		/* VOC_Operations reporting */
+		DECLARE @iJobID int
+		DECLARE @nJobName nvarchar(128)
+		DECLARE @nProcess nvarchar(128)
+		DECLARE @dLoadStartTS datetime2
+		DECLARE @dLoadEndTS datetime2
+
+		/* Input parms */
+		DECLARE @nSrcFQ nvarchar(392)
+		DECLARE @nDestFQ nvarchar(392)
+		DECLARE @nPreExportSPFQ nvarchar(392)
+
+		/* Cursor Variables */
+		DECLARE @nSystemID nvarchar(128) = 'HLTH' 
+		DECLARE @nSrcDB nvarchar(128) = 'HLTH_Staging' 
+		DECLARE @nSrcSchema nvarchar(128) 
+		DECLARE @nSrcTable nvarchar(128) 
+		DECLARE @nDestDB nvarchar(128) = 'VOC_DataHub' 
+		DECLARE @nLoadSPName nvarchar(128) 
+		DECLARE @nDestSchema nvarchar(128) 
+		DECLARE @nDestTable nvarchar(128) 
+		DECLARE @bTruncateBeforeLoad bit
+
+		DECLARE @nPreExportSPSchema nvarchar(128) 
+		DECLARE @nPreExportSPTable nvarchar(128) 
+
+		DECLARE @iLoadOrder int
+
+		/* Resilience Error handling (These variables are for the inner catch block.) */
+		DECLARE @iRErrNo int
+		DECLARE @nRErrMsg nvarchar(2048)
+		DECLARE @iRErrNoLast int
+		DECLARE @nRErrMsgAgg nvarchar(max)
+		DECLARE @iLoadErrors int = 0
+
+
+		/* Iterate load tables */
+		DECLARE curLoad CURSOR STATIC LOCAL FORWARD_ONLY
+			FOR SELECT 
+					[SystemID], 
+					[SrcDB], 
+					[SrcSchema], 
+					[SrcTable], 
+					[DestDB], 
+					[LoadSPName], 
+					[DestSchema], 
+					[DestTable], 
+					[TruncateBeforeLoad],
+					[PreExportSPSchema],
+					[PreExportSPName],
+					--[EnabledFlag],
+					[LoadOrder]
+				FROM [etl].[DataHubTableLoadList] with (nolock)
+				WHERE EnabledFlag = 1
+				ORDER BY 
+					coalesce([LoadOrder],2147483647) asc,
+					[SrcSchema] asc,
+					[SrcTable] asc,
+					[DestSchema] asc,
+					[DestTable] asc
+
+		OPEN curLoad
+
+		IF @bSupportJobReporting = 1
+		BEGIN
+			SET @nJobName = concat(coalesce(db_name(),''),'..',coalesce(OBJECT_NAME(@@PROCID),'SP'))
+			SET @nProcess = concat(@nJobName,' for ',@nSystemID,' Load DataHub')
+
+			--EXEC @iJobID = [$(VOC_Operations)].[dbo].[LogJobStart] @jobName = @nJobName, @jobDateTime = @dNow, @process = @nProcess, @sourceDatabase = @nSrcDB, @destDatabase = @nDestDB
+			EXEC @iJobID = [VOC_Operations].[dbo].[LogLoadJobStart] @jobName = @nJobName, @jobDateTime = @dNow, @process = @nProcess, @sourceDatabase = @nSrcDB, @destDatabase = @nDestDB
+
+		END
+
+		FETCH NEXT FROM curLoad INTO 
+			@nSystemID, 
+			@nSrcDB, 
+			@nSrcSchema, 
+			@nSrcTable, 
+			@nDestDB, 
+			@nLoadSPName, 
+			@nDestSchema, 
+			@nDestTable, 
+			@bTruncateBeforeLoad,
+			@nPreExportSPSchema,
+			@nPreExportSPTable,
+			@iLoadOrder 
+
+		WHILE @@FETCH_STATUS = 0
+		BEGIN
+			SET @dLoadStartTS = sysdatetime()
+
+			SET @iRErrNo = null
+			SET @nRErrMsg = null 
+
+			IF coalesce(@nPreExportSPTable,'') <> ''
+			BEGIN
+				SET @nPreExportSPFQ  = concat(coalesce(@nPreExportSPSchema,'etl'),'.',@nPreExportSPTable)
+
+				IF @iLoggingLevel >= 2
+				BEGIN
+					INSERT INTO [HLTH_Landing].[etl].[Log_HLTH_ETL] ([TS],[Source],[ErrorNumber],[ErrorMessage],[Metadata],[RowCount])
+						VALUES (sysdatetime(),coalesce(OBJECT_NAME(@@PROCID),'SP'),null,null,concat('Pre-export SP = ',@nPreExportSPFQ),null)
+				END
+
+				IF @bExec = 1
+				BEGIN
+
+					EXEC @iReturn = @nPreExportSPFQ
+
+					IF @iLoggingLevel >= 2
+					BEGIN
+						INSERT INTO [HLTH_Landing].[etl].[Log_HLTH_ETL] ([TS],[Source],[ErrorNumber],[ErrorMessage],[Metadata],[RowCount])
+							VALUES (sysdatetime(),coalesce(OBJECT_NAME(@@PROCID),'SP'),null,null,concat('Pre-export SP = ',@nPreExportSPFQ, ' returned ',cast(@iReturn as nvarchar(36))),null)
+					END
+				END
+				ELSE
+				BEGIN
+					print concat('Pre-export SP = ',@nPreExportSPFQ)	
+				END
+			END
+
+
+			--SET @nSrcFQ = concat(quotename(@nSrcDB),'.',quotename(@nSrcSchema),'.',quotename(@nSrcTable))
+			SET @nSrcFQ = concat(@nSrcDB,'.',@nSrcSchema,'.',@nSrcTable)
+			--SET @nDestFQ = concat(quotename(@nDestDB),'.',coalesce(quotename(@nDestSchema),quotename(@nSrcSchema)),'.',coalesce(quotename(@nDestTable),quotename(@nSrcTable)))
+			SET @nDestFQ = concat(@nDestDB,'.',coalesce(@nDestSchema,@nSrcSchema),'.',coalesce(@nDestTable,@nSrcTable))
+
+			IF @bTruncateBeforeLoad = 1
+			BEGIN
+				SET @nSQL = concat('TRUNCATE TABLE ',@nDestFQ,'; ')
+
+				IF @bExec = 1
+				BEGIN
+					IF @iLoggingLevel >= 2
+					BEGIN
+						INSERT INTO [HLTH_Landing].[etl].[Log_HLTH_ETL] ([TS],[Source],[ErrorNumber],[ErrorMessage],[Metadata],[RowCount])
+							VALUES (sysdatetime(),coalesce(OBJECT_NAME(@@PROCID),'SP'),null,null,concat('Truncating ',@nDestFQ),null)
+					END
+
+					EXEC (@nSQL)
+				END
+				ELSE
+				BEGIN
+					print 'TruncateBeforeLoad set = 1'			
+				END
+			END
+	
+			IF @bExec = 1
+			BEGIN
+				IF @iLoggingLevel >= 2
+				BEGIN
+					INSERT INTO [HLTH_Landing].[etl].[Log_HLTH_ETL] ([TS],[Source],[ErrorNumber],[ErrorMessage],[Metadata],[RowCount])
+						VALUES (sysdatetime(),coalesce(OBJECT_NAME(@@PROCID),'SP'),null,null,concat('Starting Load ',@nSrcFQ,'->',@nDestFQ,' using ',@nLoadSPName),null)
+				END
+
+				/* Inner catch block so we can continue to load tables if one should fail */
+				BEGIN TRY
+					IF @nLoadSPName = 'Type0Insert'
+					BEGIN 
+						EXEC @iReturn = [VOC_Operations].[dbo].[Type0Insert] @source = @nSrcFQ, @destination = @nDestFQ
+					END
+					ELSE IF @nLoadSPName = 'Type0InsertWithLoadDate' 
+					BEGIN 
+						EXEC @iReturn = [VOC_Operations].[dbo].[Type0InsertWithLoadDate] @source = @nSrcFQ, @destination = @nDestFQ, @loadDateTime = @dNow
+					END 
+					ELSE IF @nLoadSPName = 'Type0Upsert' 
+					BEGIN 
+						EXEC @iReturn = [VOC_Operations].[dbo].[Type0Upsert] @source = @nSrcFQ, @destination = @nDestFQ
+					END 
+					ELSE IF @nLoadSPName = 'Type1Merge' 
+					BEGIN 
+						EXEC @iReturn = [VOC_Operations].[dbo].[Type1Merge] @source = @nSrcFQ, @destination = @nDestFQ
+					END 
+					ELSE IF @nLoadSPName = 'Type1MergeBySource' 
+					BEGIN 
+						EXEC @iReturn = [VOC_Operations].[dbo].[Type1MergeBySource] @source = @nSrcFQ, @destination = @nDestFQ, @recordSourceCode = @nSystemID
+					END 
+					ELSE IF @nLoadSPName = 'Type1MergeSoftDelete' 
+					BEGIN 
+						EXEC @iReturn = [VOC_Operations].[dbo].[Type1MergeSoftDelete] @source = @nSrcFQ, @destination = @nDestFQ
+					END 
+					ELSE IF @nLoadSPName = 'Type2Merge' 
+					BEGIN 
+						EXEC @iReturn = [VOC_Operations].[dbo].[Type2Merge] @source = @nSrcFQ, @destination = @nDestFQ
+					END 
+					ELSE IF @nLoadSPName = 'Type2MergeBySource' 
+					BEGIN 
+						EXEC @iReturn = [VOC_Operations].[dbo].[Type2MergeBySource] @source = @nSrcFQ, @destination = @nDestFQ, @recordSourceCode = @nSystemID
+					END 
+					ELSE 
+					BEGIN
+						print concat('LoadSPName not recognised (',@nLoadSPName,')')
+
+						IF @iLoggingLevel >= 1
+						BEGIN
+							INSERT INTO [HLTH_Landing].[etl].[Log_HLTH_ETL] ([TS],[Source],[ErrorNumber],[ErrorMessage],[Metadata],[RowCount])
+								VALUES (sysdatetime(),coalesce(OBJECT_NAME(@@PROCID),'SP'),null,null,concat('WARNING for ',@nSrcFQ,'->',@nDestFQ,' Load SP ',@nLoadSPName,' is not recognised!'),null)
+						END
+					END
+				END TRY
+				BEGIN CATCH
+					SET @iRErrNo = ERROR_NUMBER() 
+					SET @nRErrMsg = ERROR_MESSAGE() 
+
+					SET @iLoadErrors += 1
+
+					IF @iLoggingLevel >= 1
+					BEGIN
+						INSERT INTO [HLTH_Landing].[etl].[Log_HLTH_ETL] ([TS],[Source],[ErrorNumber],[ErrorMessage],[Metadata],[RowCount])
+							VALUES (sysdatetime(),coalesce(OBJECT_NAME(@@PROCID),'SP'),@iRErrNo,@nRErrMsg,'',null)
+					END
+
+					IF @bSupportJobReporting = 1
+					BEGIN
+						/* Aggregate error messages */
+						SET @iRErrNoLast = @iRErrNo 
+						SET @nRErrMsgAgg = concat(coalesce(@nRErrMsgAgg,''),'#',cast(@iLoadErrors as nvarchar(36)),':',coalesce(@nRErrMsg,''),'; ')
+
+					END
+
+					/* Note: VOC_Operations error reporting is handled below */
+
+				END CATCH
+
+
+				SET @iRowCount = @iReturn
+				SET @iRowCountTotal += coalesce(@iRowCount ,0)
+
+
+				SET @dLoadEndTS = sysdatetime()
+
+				IF @bSupportJobReporting = 1
+				BEGIN
+
+					INSERT INTO [VOC_Operations].[dbo].[TableLoad_DataHub] (
+						[jobName], 
+						[jobRunID], 
+						[operation], 
+						[sourceDatabase], 
+						[destDatabase], 
+						[tableName], 
+						[enabled], 
+						[stratum], 
+						[startDateTime], 
+						[endDateTime], 
+						[loadDuration_msec], 
+						[status], 
+						[rowDeltaCount], 
+						[errorNumber], 
+						[errorMessage], 
+						[stepName], 
+						[procedure], 
+						[metaData]
+						) 
+						VALUES (
+							@nJobName, 
+							@iJobID, 
+							@nLoadSPName, 
+							@nSrcDB, 
+							@nDestDB, 
+							@nSrcTable, 
+							'Y',			-- enabled (only enabled jobs are included in the cursor selection)
+							@iLoadOrder,	-- stratum
+							@dLoadStartTS, 
+							@dLoadEndTS, 
+							DATEDIFF(millisecond,@dLoadStartTS,@dLoadEndTS), -- @iloadDuration, 
+							CASE
+								WHEN @iReturn >= 0 THEN 'LOADED'
+								ELSE 'FAILED'
+							END,			-- @status, 
+							NULL,			-- @iRowDeltaCount 
+							@iRErrNo,		-- error number
+							@nRErrMsg,		-- error message
+							null,			-- @stepName, 
+							@nJobName,		-- procedure
+							concat('Raw row count: ',coalesce(try_cast(@iRowCount as varchar(36)),0),';')			-- Metadata
+						);
+						
+				END
+
+				IF @iLoggingLevel >= 2
+				BEGIN
+					INSERT INTO [HLTH_Landing].[etl].[Log_HLTH_ETL] ([TS],[Source],[ErrorNumber],[ErrorMessage],[Metadata],[RowCount])
+						VALUES (sysdatetime(),coalesce(OBJECT_NAME(@@PROCID),'SP'),@iRErrNo,@nRErrMsg,concat('Finished Load ',@nSrcFQ,'->',@nDestFQ),@iRowCount)
+				END
+
+			END
+			ELSE
+			BEGIN
+				SET @nOut = concat('------------------------------',@nCRLF)
+				SET @nOut = concat(@nOut,'Src = ',@nSrcFQ,@nCRLF)
+				SET @nOut = concat(@nOut,'Dest = ',@nDestFQ,@nCRLF)
+				SET @nOut = concat(@nOut,'LoadSP = ',@nLoadSPName,@nCRLF)
+				SET @nOut = concat(@nOut,'Time = ',cast(@dNow as nvarchar(36)),@nCRLF)
+				SET @nOut = concat(@nOut,'SystemID = ',@nSystemID,@nCRLF)
+
+				IF @iLoggingLevel >= 3
+				BEGIN
+					INSERT INTO [HLTH_Landing].[etl].[Log_HLTH_ETL] ([TS],[Source],[ErrorNumber],[ErrorMessage],[Metadata],[RowCount])
+						VALUES (sysdatetime(),coalesce(OBJECT_NAME(@@PROCID),'SP'),null,null,concat('Execution is set = OFF (',@nSrcFQ,'->',@nDestFQ,') Status = ',@nOut),@iRowCount)
+				END
+
+				print @nOut
+
+				SET @iRowCount = -1
+			END
+
+			FETCH NEXT FROM curLoad INTO 
+				@nSystemID, 
+				@nSrcDB, 
+				@nSrcSchema, 
+				@nSrcTable, 
+				@nDestDB, 
+				@nLoadSPName, 
+				@nDestSchema, 
+				@nDestTable, 
+				@bTruncateBeforeLoad,
+				@nPreExportSPSchema,
+				@nPreExportSPTable,
+				@iLoadOrder 
+		END
+
+		CLOSE curLoad
+		DEALLOCATE curLoad
+
+		IF @bSupportJobReporting = 1
+		BEGIN
+			SET @dNow = sysdatetime()
+			--EXEC [$(VOC_Operations)].[dbo].[LogJobEnd] @jobName = @nJobName, @jobDateTime = @dNow, @iErrorCount = -1
+			EXEC [VOC_Operations].[dbo].[LogLoadJobEnd] 
+				@destDatabase = @nDestDB, 
+				@jobRunID = @iJobID, 
+				@jobDateTime = @dNow, 
+				@iErrorCount = @iLoadErrors, 
+				@iErrNo = @iRErrNoLast,	-- NB Displays the last error number if multiple errors 
+				@nErrMsg = @nRErrMsgAgg
+		END
+		
+		/* Note:	LogLoadJobEnd updates VOC_DataHub.dbo.DataSourceStatus, so if Job Reporting is turned off, this process must do it itself. 
+					We also update the table if the override @bAlwaysUpdateDataSourceStatus = 1, which may delete the write from LogLoadJobEnd.
+		*/
+		IF @bAlwaysUpdateDataSourceStatus = 1 or @bSupportJobReporting <> 1
+		BEGIN
+			IF @bExec = 1
+			BEGIN
+				DELETE FROM [VOC_DataHub].[dbo].[DataSourceStatus]
+				WHERE [dataSystemCode] = @nSystemIDCode;
+
+				INSERT INTO [VOC_DataHub].[dbo].[DataSourceStatus] ([dataSystemCode],[lastUpdateDateTime])
+					VALUES (@nSystemIDCode,@dNow)
+			
+				IF @iLoggingLevel >= 2
+				BEGIN
+					INSERT INTO [HLTH_Landing].[etl].[Log_HLTH_ETL] ([TS],[Source],[ErrorNumber],[ErrorMessage],[Metadata],[RowCount])
+						VALUES (sysdatetime(),coalesce(OBJECT_NAME(@@PROCID),'SP'),null,null,concat('Updated ','VOC_DataHub.dbo.DataSourceStatus',' with ',@nSystemIDCode,'=',cast(@dNow as nvarchar(36))),1)
+
+				END
+			END
+		END
+		IF @iLoadErrors > 0
+		BEGIN
+			SET @nRErrMsgAgg = left(concat('Load errors! ',@nRErrMsgAgg),2048)
+			;THROW 51000,@nRErrMsgAgg, @iLoadErrors;
+		END
+
+		RETURN @iRowCountTotal
+	END TRY
+	BEGIN CATCH
+		DECLARE @iErrNo int = ERROR_NUMBER() 
+		DECLARE @nErrMsg nvarchar(2048) = ERROR_MESSAGE() 
+
+		IF coalesce(@iLoggingLevel,0) <> 0
+		BEGIN
+			INSERT INTO [HLTH_Landing].[etl].[Log_HLTH_ETL] ([TS],[Source],[ErrorNumber],[ErrorMessage],[Metadata],[RowCount])
+				VALUES (sysdatetime(),coalesce(OBJECT_NAME(@@PROCID),'SP'),@iErrNo,@nErrMsg,concat('Load error count = ',cast(@iLoadErrors as nvarchar(36))),null)
+		END
+
+		;THROW 51000,@nRErrMsgAgg, @iLoadErrors;
+
+		RETURN -1
+		
+	END CATCH
+END
+GO
+
+
