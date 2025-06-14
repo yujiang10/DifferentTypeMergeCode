@@ -1,0 +1,462 @@
+USE [HLTH_Staging]
+GO
+
+/****** Object:  StoredProcedure [etl].[spDeltaLoadStagingTables_HLTH]    Script Date: 14/06/2025 10:45:38 AM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+CREATE PROCEDURE [etl].[spDeltaLoadStagingTables_HLTH] 
+	@adAuditDate datetime2 = null 
+AS
+BEGIN
+	/*
+		Purpose
+		-------
+
+		Load the staging tables with an insert-based delta from the landing DB
+
+		1. Iterate the list of staging tables
+		2. Determine a delta and insert changed records
+		3. Determine deletes and insert soft delete records
+
+		Environmental Requirements
+		--------------------------
+		1. Target staging table names shall begin with 'STG_'
+		2. The source view used for the soft deletes shall be named the same as the underling table with the prefix 'VW_CUR_WL_'
+		3. The entries in [etl].[StagingTableLoadList] must be schema-qualified
+		4. Columns that hold the same data in landing and staging shall be identically named.
+		5. The Staging tables must have a primary key defined named the same as the staging table with a 'PK_' prefix
+		6. Fixed metadata columns in the staging and landing tables shall be named:
+			'WLID'	- The TMS ID (CLIENT_NUMBER) of a whitelisted TMS client that was associated with this record and so flagged its inclusion in the 360VOC dataset
+			'SystemID'	- The identifier for this data source; always 'TMS'
+			'LoadTS'	- The timestamp of data insertion/extraction
+			'ExportDataLevel'	- An indicator of the whitelisting nature of this record; 2 = A child at attention of territory families; 1 = A person with a relationship of interest to a child at attention of territory families; 0 = deleted or supressed  
+			'ActiveStatus'	- A flag to indicate a record's currency; 'C' = Current; 'D' = Deleted
+			'RowHash'	-	A non-reverisble hash value of the non-key columns of a record, used to detect deltas.
+		6. Staging table columns that are not fixed metadata columns listed above and do not participate in the primary key shall be nullable.
+		7. Note a 'HashLen' int column may be included to monitor that input strings to the hash calculation are not exceeding the maximum permissible length, but this column shall be nullable.
+
+
+	*/
+
+	SET NOCOUNT ON;
+
+	/* Config setting */
+	DECLARE @bExeuteSQL bit = 1 -- Set = 1 to execute the Staging Load Queries, Set = 0 to display the query only (interim executable queries will be executeed irrespective of this setting)
+	DECLARE @iDebug int = 0		-- Set = 1+ for verbose debugging
+	DECLARE @bDoAuditDate bit = 0 -- Set = 1 to write to AuditDate before inserts
+	DECLARE @dAuditDate datetime2 = coalesce(@adAuditDate,datefromparts(9999,12,31))	-- If @bDoAuditDate = 1, sets the audit date for the views
+	DECLARE @nSystemID nvarchar(36) = 'HLTH'	-- The system ID
+	DECLARE @nLandingDBDefault nvarchar(128) = 'HLTH_Landing'	-- The name of the TMS Landing DB
+	DECLARE @nStagingDBDefault nvarchar(128) = 'HLTH_Staging'	-- The name of the TMS staging DB
+	DECLARE @nVW_CUR_Prefix nvarchar(128) = 'VW_CUR_'	-- The consistent prefix for the Current Record View of the table
+
+	/* Processing variables */
+	DECLARE @iRows int	-- Log row counts
+	DECLARE @iRowsTot int	-- Log row counts for RETURN
+
+	/* Dynamic SQL */
+	DECLARE @nSQL nvarchar(max)			-- General dynamic SQL to execute
+	DECLARE @nSQL_Join nvarchar(max)	-- SQL snippet:  Join between Landing DB source view and Staging DB target
+	DECLARE @nSQL_PKCols nvarchar(max)	-- SQL snippet:  Non-fixed columns in the Staging PK
+	DECLARE @nSQL_Cols nvarchar(max)	-- SQL snippet:  Columns shared between staging and landing
+
+	/* Formatting breaks */
+	DECLARE @vTAB varchar(1) = char(9)
+	DECLARE @vCRLF varchar(2) = concat(char(13),char(10))
+
+	/* Column store table variables */
+	DECLARE @tCol table (COLUMN_NAME nvarchar(128))		-- Table variable containing the columns shared between staging and landing
+	DECLARE @tPKCol table (COLUMN_NAME nvarchar(128))	-- Table variable containing the PK columns in the staging table 
+
+	/* Cursor variables */
+		/* curLoadList */
+	DECLARE @ncLandingDB nvarchar(128)	-- Name of the current landing DB
+	DECLARE @ncStagingDB nvarchar(128)	-- Name of the current staging DB
+	DECLARE @ncLandO nvarchar(261)	-- Name of the current landing view
+	DECLARE @ncStageO nvarchar(261)	-- Name of the current staging table
+		/* curPKCol */
+	DECLARE @nPKCol nvarchar(128)	-- Name of the current PK column
+		/* curCol */
+	DECLARE @nCol nvarchar(128)		-- Name of the current column
+
+	/* Error Handling */
+	DECLARE @iErrNo int = ERROR_NUMBER() 
+	DECLARE @nErrMsg nvarchar(2047) = ERROR_MESSAGE() 
+	DECLARE @iErrors int = 0
+	DECLARE @nErrAgg nvarchar(max) = ''
+
+	BEGIN TRY
+
+		INSERT INTO [HLTH_Landing].[etl].[Log_HLTH_ETL] ([TS],[Source],[ErrorNumber],[ErrorMessage],[Metadata],[RowCount])
+			VALUES (sysdatetime(),coalesce(OBJECT_NAME(@@PROCID),'SP'),@iErrNo,@nErrMsg,'',@iRows)
+
+		/* Log start */
+		INSERT INTO [HLTH_Landing].[etl].[Log_HLTH_ETL] ([TS], [Source], [ErrorNumber], [ErrorMessage], [Metadata], [RowCount])
+			VALUES (sysdatetime(),coalesce(OBJECT_NAME(@@PROCID),'SP'),null,null,concat('Start Staging Loads.  Exec set = ',cast(@bExeuteSQL as nvarchar(36))),null)
+
+		SET @iRowsTot = 0
+
+		DECLARE curLoadList CURSOR STATIC LOCAL FORWARD_ONLY
+			FOR SELECT
+				coalesce([LandingDB],@nLandingDBDefault) as [LandingDB], 
+				[LandingName], 
+				coalesce([StagingDB],@nStagingDBDefault) as [StagingDB], 
+				[StagingName]
+			FROM [etl].[StagingTableLoadList] with (nolock)
+			WHERE
+				[EnableLoad] = 1
+				and coalesce([SystemID],'') = @nSystemID
+			ORDER BY 
+				coalesce([LoadOrder],2147483647) asc,
+				[StagingName] asc,
+				[LandingName] asc
+						
+		OPEN curLoadList
+
+		SET @nSQL_Join = ''
+
+		FETCH NEXT FROM curLoadList INTO @ncLandingDB, @ncLandO, @ncStagingDB, @ncStageO
+
+		WHILE @@FETCH_STATUS = 0
+		BEGIN
+			/* Log start */
+			INSERT INTO [HLTH_Landing].[etl].[Log_HLTH_ETL] ([TS], [Source], [ErrorNumber], [ErrorMessage], [Metadata], [RowCount])
+				VALUES (sysdatetime(),coalesce(OBJECT_NAME(@@PROCID),'SP'),null,null,concat('Start Staging Load ',@ncLandingDB,'.',@ncLandO,' -> ',@ncStagingDB,'.',@ncStageO),null)
+
+			/* Get the PK Column list */
+			SET @nSQL = concat('SELECT [COLUMN_NAME] ',@vCRLF)
+			SET @nSQL = concat(@nSQL,@vTAB,'FROM ',quotename(@ncStagingDB),'.[INFORMATION_SCHEMA].[CONSTRAINT_COLUMN_USAGE] ',@vCRLF)
+			SET @nSQL = concat(@nSQL,@vTAB,'WHERE ',@vCRLF)
+			SET @nSQL = concat(@nSQL,@vTAB,@vTAB,'[TABLE_SCHEMA] = ''',PARSENAME(@ncStageO,2),'''',@vCRLF)
+			SET @nSQL = concat(@nSQL,@vTAB,@vTAB,'and [TABLE_NAME] = ''',PARSENAME(@ncStageO,1),'''',@vCRLF)
+			SET @nSQL = concat(@nSQL,@vTAB,@vTAB,'and [CONSTRAINT_NAME] = ''',concat('PK_',PARSENAME(@ncStageO,1)),'''',@vCRLF)
+
+			DELETE FROM @tPKCol
+			
+			IF @iDebug > 1
+			BEGIN
+				SELECT @nSQL as SQLCommand
+			END
+
+			INSERT INTO @tPKCol EXEC (@nSQL)
+
+			IF @iDebug > 1
+			BEGIN
+				SELECT 'tPKCol' as Run,* FROM @tPKCol
+			END
+
+			/* Get the full matched Column list */
+			SET @nSQL = concat('SELECT S.[COLUMN_NAME] ',@vCRLF)
+			SET @nSQL = concat(@nSQL,@vTAB,'FROM ',quotename(@ncStagingDB),'.[INFORMATION_SCHEMA].[COLUMNS] S ',@vCRLF)
+			SET @nSQL = concat(@nSQL,@vTAB,'inner join ',quotename(@ncLandingDB),'.[INFORMATION_SCHEMA].[COLUMNS] L ',@vCRLF)
+			SET @nSQL = concat(@nSQL,@vTAB,'on L.COLUMN_NAME = S.COLUMN_NAME ',@vCRLF)
+			SET @nSQL = concat(@nSQL,@vTAB,'WHERE ',@vCRLF)
+			SET @nSQL = concat(@nSQL,@vTAB,@vTAB,'S.[TABLE_SCHEMA] = ''',PARSENAME(@ncStageO,2),'''',@vCRLF)
+			SET @nSQL = concat(@nSQL,@vTAB,@vTAB,'and S.[TABLE_NAME] = ''',PARSENAME(@ncStageO,1),'''',@vCRLF)
+			SET @nSQL = concat(@nSQL,@vTAB,@vTAB,'and L.[TABLE_SCHEMA] = ''',PARSENAME(@ncLandO,2),'''',@vCRLF)
+			SET @nSQL = concat(@nSQL,@vTAB,@vTAB,'and L.[TABLE_NAME] = ''',PARSENAME(@ncLandO,1),'''',@vCRLF)
+
+			DELETE FROM @tCol
+
+			IF @iDebug > 1
+			BEGIN
+				SELECT @nSQL as SQLCommand
+			END
+
+			INSERT INTO @tCol EXEC (@nSQL)
+			
+			IF @iDebug > 1
+			BEGIN
+				SELECT 'tCol' as Run,* FROM @tCol
+			END 
+
+			/* Get the PK Cols of the Staging table */
+			DECLARE curPKCol CURSOR LOCAL STATIC FORWARD_ONLY
+				FOR SELECT 
+						[COLUMN_NAME]
+					FROM @tPKCol T
+					ORDER BY
+						[COLUMN_NAME]
+
+			OPEN curPKCol
+
+			SET @nSQL_Join = ''
+			SET @nSQL_PKCols = ''
+
+			FETCH NEXT FROM curPKCol INTO @nPKCol
+
+			WHILE @@FETCH_STATUS = 0
+			BEGIN
+				IF @nPKCol not in ('LoadTS','ExportDataLevel','ActiveStatus','RowHash')
+				BEGIN
+					SET @nSQL_Join = concat(@nSQL_Join,@vTAB,@vTAB,'L.',quotename(@nPKCol),' = S.',quotename(@nPKCol))
+				END
+
+				IF @nPKCol not in ('WLID','SystemID','LoadTS','ExportDataLevel','ActiveStatus','RowHash')
+				BEGIN
+					SET @nSQL_PKCols = concat(@nSQL_PKCols,@vTAB,'S.',quotename(@nPKCol))
+				END
+
+				FETCH NEXT FROM curPKCol INTO @nPKCol
+
+				IF @@FETCH_STATUS = 0
+				BEGIN
+					IF @nPKCol not in ('LoadTS','ExportDataLevel','ActiveStatus','RowHash') and right(@nSQL_Join,len(concat(' and ',@vCRLF))) <> concat(' and ',@vCRLF) and @nSQL_Join <> ''
+					BEGIN
+						SET @nSQL_Join = concat(@nSQL_Join,' and ',@vCRLF)
+					END
+
+					IF @nPKCol not in ('WLID','SystemID','LoadTS','ExportDataLevel','ActiveStatus','RowHash') and right(@nSQL_PKCols,len(concat(',',@vCRLF))) <> concat(',',@vCRLF) and @nSQL_PKCols <> ''
+					BEGIN
+						SET @nSQL_PKCols = concat(@nSQL_PKCols,',',@vCRLF)
+					END
+				END
+			END
+
+
+			SET @nSQL_Join = concat(@nSQL_Join,@vCRLF)
+			SET @nSQL_PKCols = concat(@nSQL_PKCols,@vCRLF)
+
+			CLOSE curPKCol
+			DEALLOCATE curPKCol
+
+			/* Get all the matching Cols of the Landing and Staging objects */
+			DECLARE curCols CURSOR LOCAL STATIC FORWARD_ONLY
+				FOR SELECT 
+						[COLUMN_NAME]
+					FROM @tCol T
+					ORDER BY
+						[COLUMN_NAME]
+
+			OPEN curCols
+
+			SET @nSQL_Cols = ''
+
+			FETCH NEXT FROM curCols INTO @nCol
+
+			WHILE @@FETCH_STATUS = 0
+			BEGIN
+				SET @nSQL_Cols = concat(@nSQL_Cols,@vTab,'L.',quotename(@nCol))
+
+				FETCH NEXT FROM curCols INTO @nCol
+
+				IF @@FETCH_STATUS = 0
+				BEGIN
+					SET @nSQL_Cols = concat(@nSQL_Cols,',',@vCRLF)
+				END
+			END
+
+			IF right(@nSQL_Cols,1) = ','
+			BEGIN
+				SET @nSQL_Cols = left(@nSQL_Cols,len(@nSQL_Cols)-1)
+			END
+
+			SET @nSQL_Cols = concat(@nSQL_Cols,@vCRLF)
+
+			CLOSE curCols
+			DEALLOCATE curCols
+
+			/* Build the dynamic SQL for the insert records */
+			/* Note we modify LoadTS */
+			SET @nSQL = concat('INSERT INTO ',@ncStagingDB,'.',@ncStageO,' (',@vCRLF,replace(@nSQL_Cols,'L.',''),') ',@vCRLF)
+			SET @nSQL = concat(@nSQL,'SELECT ',@vCRLF,replace(@nSQL_Cols,'L.[LoadTS]','sysdatetime() as [LoadTS]'),' ')		-- Modify LoadTS
+			SET @nSQL = concat(@nSQL,@vTAB,'FROM ',@ncLandingDB,'.',@ncLandO,' L with (nolock) ',@vCRLF)						
+			SET @nSQL = concat(@nSQL,@vTAB,'left outer join ',@ncStagingDB,'.',replace(@ncStageO,parsename(@ncStageO,1),concat(@nVW_CUR_Prefix,parsename(@ncStageO,1))),' S with (nolock) ',@vCRLF)	-- Join to the CUR view
+			SET @nSQL = concat(@nSQL,@vTAB,@vTAB,'on ',@vCRLF,@nSQL_Join,@vTAB,@vTAB,' and L.RowHash = S.RowHash ',@vCRLF)
+			SET @nSQL = concat(@nSQL,@vTAB,'WHERE S.RowHash is null ',@vCRLF)
+
+			
+			IF @bExeuteSQL = 1
+			BEGIN
+				IF @iDebug > 0
+				BEGIN
+					SELECT @nSQL as SQLCommand
+				END
+
+				IF @bDoAuditDate = 1
+				BEGIN
+		
+					DELETE FROM etl.AuditDate WHERE ObjectName = 'ALL'
+
+					INSERT INTO etl.AuditDate (ObjectName,AuditTS,CURFilter)
+					VALUES ('ALL',@dAuditDate,'C')
+				END 
+
+				/* Execute the load */
+
+				BEGIN TRY
+					EXEC (@nSQL)
+
+					SET @iRows = @@ROWCOUNT
+					SET @iRowsTot = @iRowsTot + @iRows
+
+				END TRY
+				BEGIN CATCH
+					SET @iErrNo = ERROR_NUMBER() 
+					SET @nErrMsg = ERROR_MESSAGE() 
+
+					SET @nErrAgg = concat(@nErrAgg,'ERR! ',@ncLandO,'->',@ncStageO,':',coalesce(@nErrMsg,''),';')
+
+					SET @iErrors =+ 1
+
+					INSERT INTO [HLTH_Landing].[etl].[Log_HLTH_ETL] ([TS],[Source],[ErrorNumber],[ErrorMessage],[Metadata],[RowCount])
+						VALUES (sysdatetime(),coalesce(OBJECT_NAME(@@PROCID),'SP'),@iErrNo,@nErrMsg,concat('Error in record insert for ',@ncLandO,'->',@ncStageO),@iRows)
+
+				END CATCH
+
+			END
+			ELSE
+			BEGIN
+				SELECT 'Current' as ActiveRowType, @nSQL as SQLCommand
+
+				SET @iRows = -1
+			END
+
+
+			/* Log inserts */
+			INSERT INTO [HLTH_Landing].[etl].[Log_HLTH_ETL] ([TS], [Source], [ErrorNumber], [ErrorMessage], [Metadata], [RowCount])
+				VALUES (sysdatetime(),coalesce(OBJECT_NAME(@@PROCID),'SP'),null,null,concat('Staging Load ',@ncLandingDB,'.',@ncLandO,' -> ',@ncStagingDB,'.',@ncStageO,' inserted:'),@iRows)
+
+
+			/* Build the dynamic SQL for the soft delete records */
+			SET @nSQL = concat('INSERT INTO ',@ncStagingDB,'.',@ncStageO,' (',@vCRLF)
+			SET @nSQL = concat(@nSQL,@vTAB,'[WLID],',@vCRLF,@vTAB,'[SystemID],',@vCRLF,@vTAB,'[LoadTS],',@vCRLF,@vTAB,'[ExportDataLevel],',@vCRLF,@vTAB,'[ActiveStatus],',@vCRLF,@vTAB,'[RowHash],',@vCRLF)
+			
+			IF @nSQL_PKCols <> @vCRLF
+			BEGIN
+				SET @nSQL = concat(@nSQL,replace(@nSQL_PKCols,'S.',''))
+			END
+			ELSE
+			BEGIN
+				SET @nSQL = left(@nSQL,len(@nSQL)-3)
+			END
+
+			SET @nSQL = concat(@nSQL,') ',@vCRLF)
+			SET @nSQL = concat(@nSQL,'SELECT ',@vCRLF)
+			SET @nSQL = concat(@nSQL,@vTab,'S.[WLID],',@vCRLF)
+			SET @nSQL = concat(@nSQL,@vTab,'S.[SystemID],',@vCRLF)
+			SET @nSQL = concat(@nSQL,@vTab,'sysdatetime() as [LoadTS],',@vCRLF)
+			SET @nSQL = concat(@nSQL,@vTab,'0 as [ExportDataLevel],',@vCRLF)
+			SET @nSQL = concat(@nSQL,@vTab,'''D'' as [ActiveStatus],',@vCRLF)
+			SET @nSQL = concat(@nSQL,@vTab,'''00000000-0000-0000-0000-000000000000'' as [RowHash]')
+
+			IF @nSQL_PKCols <> @vCRLF
+			BEGIN
+				SET @nSQL = concat(@nSQL,',',@vCRLF)
+				SET @nSQL = concat(@nSQL,@vTab,@nSQL_PKCols)		
+			END
+			ELSE
+			BEGIN
+				SET @nSQL = concat(@nSQL,@vCRLF)
+			END
+
+
+			SET @nSQL = concat(@nSQL,@vTAB,'FROM ',@ncStagingDB,'.',replace(@ncStageO,parsename(@ncStageO,1),concat(@nVW_CUR_Prefix,parsename(@ncStageO,1))),' S with (nolock) ',@vCRLF)	-- NB:  The VW_CUR_WL_ stage views are the source so need to add prefix
+			SET @nSQL = concat(@nSQL,@vTAB,'left outer join ',@ncLandingDB,'.',@ncLandO,' L with (nolock) ',@vCRLF)
+			SET @nSQL = concat(@nSQL,@vTAB,@vTAB,'on ',@vCRLF,@nSQL_Join,@vCRLF)
+			SET @nSQL = concat(@nSQL,@vTAB,'WHERE L.SystemID is null ',@vCRLF)
+
+
+			IF @bExeuteSQL = 1
+			BEGIN
+				IF @iDebug > 0
+				BEGIN
+					SELECT @nSQL as SQLCommand
+				END
+
+
+				IF @bDoAuditDate = 1
+				BEGIN
+	
+					DELETE FROM etl.AuditDate WHERE ObjectName = 'ALL'
+
+					INSERT INTO etl.AuditDate (ObjectName,AuditTS,CURFilter)
+					VALUES ('ALL',@dAuditDate,'C')
+					--VALUES ('ALL',@dAuditDate,'[CD]')	-- Use this line to show delete records in the CUR view
+				END 
+				
+				/* Execute the delete record load */
+				BEGIN TRY
+					EXEC (@nSQL)
+
+					SET @iRows = @@ROWCOUNT
+					SET @iRowsTot = @iRowsTot + @iRows
+
+				END TRY
+				BEGIN CATCH
+					SET @iErrNo = ERROR_NUMBER() 
+					SET @nErrMsg = ERROR_MESSAGE() 
+
+					SET @nErrAgg = concat(@nErrAgg,'ERR! ',@ncLandO,'->',@ncStageO,':',coalesce(@nErrMsg,''),';')
+
+					SET @iErrors =+ 1
+
+					INSERT INTO [HLTH_Landing].[etl].[Log_HLTH_ETL] ([TS],[Source],[ErrorNumber],[ErrorMessage],[Metadata],[RowCount])
+						VALUES (sysdatetime(),coalesce(OBJECT_NAME(@@PROCID),'SP'),@iErrNo,@nErrMsg,concat('Error in delete record insert for ',@ncLandO,'->',@ncStageO),@iRows)
+
+				END CATCH
+
+				DELETE FROM etl.AuditDate WHERE ObjectName = 'ALL'
+
+				INSERT INTO etl.AuditDate (ObjectName,AuditTS,CURFilter)
+				VALUES ('ALL',datefromparts(9999,12,31),'C')
+
+			END
+			ELSE
+			BEGIN
+				SELECT 'Delete' as ActiveRowType, @nSQL as SQLCommand
+
+				SET @iRows = -1
+			END
+
+
+			/* Log deletes */
+			INSERT INTO [HLTH_Landing].[etl].[Log_HLTH_ETL] ([TS], [Source], [ErrorNumber], [ErrorMessage], [Metadata], [RowCount])
+				VALUES (sysdatetime(),coalesce(OBJECT_NAME(@@PROCID),'SP'),null,null,concat('Staging Load ',@ncLandingDB,'.',@ncLandO,' -> ',@ncStagingDB,'.',@ncStageO,' deleted:'),@iRows)
+
+			FETCH NEXT FROM curLoadList INTO @ncLandingDB, @ncLandO, @ncStagingDB, @ncStageO
+		END
+
+		CLOSE curLoadList
+		DEALLOCATE curLoadList
+
+		/* Log end */
+		INSERT INTO [HLTH_Landing].[etl].[Log_HLTH_ETL] ([TS], [Source], [ErrorNumber], [ErrorMessage], [Metadata], [RowCount])
+			VALUES (sysdatetime(),coalesce(OBJECT_NAME(@@PROCID),'SP'),null,null,'End Staging Loads.  Total records written:',@iRowsTot)
+
+
+		/* If there were caught errors in the inner catch block, throw an error now. */
+		IF @iErrors > 0
+		BEGIN
+			SET @nErrAgg = left(concat('Load encountered ',cast(@iErrors as nvarchar(36)),' errors! ',@nErrAgg),2047)
+
+			;THROW 51000,@nErrAgg,@iErrors
+		END
+
+		RETURN @iRowsTot
+	END TRY
+	BEGIN CATCH
+		SET @iErrNo = ERROR_NUMBER() 
+		SET @nErrMsg = ERROR_MESSAGE() 
+
+		INSERT INTO [HLTH_Landing].[etl].[Log_HLTH_ETL] ([TS],[Source],[ErrorNumber],[ErrorMessage],[Metadata],[RowCount])
+			VALUES (sysdatetime(),coalesce(OBJECT_NAME(@@PROCID),'SP'),@iErrNo,@nErrMsg,'',@iRows)
+
+		DELETE FROM etl.AuditDate WHERE ObjectName = 'ALL'
+
+		INSERT INTO etl.AuditDate (ObjectName,AuditTS,CURFilter)
+		VALUES ('ALL',datefromparts(9999,12,31),'C')
+
+		;THROW
+
+		RETURN -1
+		
+	END CATCH
+END
+GO
+
+
