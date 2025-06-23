@@ -1,0 +1,15 @@
+USE [master]; 
+
+DECLARE @nSourcePath nvarchar(4000) = N'F:\\Program Files\\Microsoft SQL Server\\MSSQL15.MSSQLSERVER\\MSSQL\\Backup\VOC_DataHub_Backup.bak'
+DECLARE @nDataPath nvarchar(4000) = N'F:\\Program Files\\Microsoft SQL Server\\MSSQL15.MSSQLSERVER\\MSSQL\\Data\VOC_DataHub.mdf'
+DECLARE @nLogPath nvarchar(4000) = N'H:\\Program Files\\Microsoft SQL Server\VOC_DataHub_log.ldf'
+
+SET @nSourcePath = replace(@nSourcePath,'\\','\')
+SET @nDataPath = replace(@nDataPath,'\\','\')
+SET @nLogPath =  replace(@nLogPath,'\\','\')
+
+
+RESTORE DATABASE [VOC_DataHub] FROM  DISK = @nSourcePath WITH  FILE = 0,  
+MOVE N'VOC_DataHub' TO @nDataPath,  
+MOVE N'VOC_DataHub_log' TO @nLogPath, 
+KEEP_REPLICATION,  NOUNLOAD,  REPLACE
