@@ -1,0 +1,6 @@
+DECLARE @nPath nvarchar(4000) = 'F:\\Program Files\\Microsoft SQL Server\\MSSQL15.MSSQLSERVER\\MSSQL\\Backup\VOC_DataHub_Backup.bak'
+
+SET @nPath = replace(@nPath, '\\','\')
+
+BACKUP DATABASE [VOC_DataHub] 
+TO Disk = @nPath WITH COPY_ONLY
